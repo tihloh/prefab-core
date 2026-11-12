@@ -97,7 +97,7 @@ if (!class_exists(PdoDatabaseAdapter::class, false)) {
 
         public function pdo(): PDO
         {
-            return $this->connection;
+            return $this->connection();
         }
 
         private function sqlContext(string $sql, array $bindings, ?string $operation = null): array
