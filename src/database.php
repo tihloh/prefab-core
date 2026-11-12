@@ -22,9 +22,26 @@ if (!class_exists(PdoDatabaseAdapter::class, false)) {
     {
         private string $ownerModule;
 
-        public function __construct(private PDO $connection, ?string $ownerModule = null)
+        /** @var PDO|\Closure */
+        private PDO|\Closure $connection;
+
+        public function __construct(PDO|\Closure $connection, ?string $ownerModule = null)
         {
+            $this->connection = $connection;
             $this->ownerModule = $ownerModule ?? $this->detectOwnerModule();
+        }
+
+        private function connection(): PDO
+        {
+            if ($this->connection instanceof PDO) {
+                return $this->connection;
+            }
+            $pdo = ($this->connection)();
+            if (!$pdo instanceof PDO) {
+                throw new \RuntimeException('Database connection resolver must return a PDO instance.');
+            }
+            $this->connection = $pdo;
+            return $pdo;
         }
 
         public function select(string $sql, array $bindings = []): array
@@ -32,7 +49,7 @@ if (!class_exists(PdoDatabaseAdapter::class, false)) {
             $context = $this->sqlContext($sql, $bindings, 'select');
             return PrefabRuntime::traceCall('database', 'select', $context, function () use ($sql, $bindings): array {
                 PrefabRuntime::traceStep('database.sql', ['sql' => $sql]);
-                $statement = $this->connection->prepare($sql);
+                $statement = $this->connection()->prepare($sql);
                 $statement->execute($bindings);
                 $rows = $statement->fetchAll(PDO::FETCH_ASSOC);
                 PrefabRuntime::traceStep('database.rows', ['rows' => count($rows)]);
@@ -45,7 +62,7 @@ if (!class_exists(PdoDatabaseAdapter::class, false)) {
             $context = $this->sqlContext($sql, $bindings);
             return PrefabRuntime::traceCall('database', $context['operation'], $context, function () use ($sql, $bindings): bool {
                 PrefabRuntime::traceStep('database.sql', ['sql' => $sql]);
-                $statement = $this->connection->prepare($sql);
+                $statement = $this->connection()->prepare($sql);
                 $ok = $statement->execute($bindings);
                 PrefabRuntime::traceStep('database.affected', ['rows' => $statement->rowCount()]);
                 return $ok;
@@ -55,13 +72,13 @@ if (!class_exists(PdoDatabaseAdapter::class, false)) {
         public function transaction(callable $callback): mixed
         {
             return PrefabRuntime::traceCall('database', 'transaction', ['owner_module' => $this->ownerModule], function () use ($callback): mixed {
-                $this->connection->beginTransaction();
+                $this->connection()->beginTransaction();
                 try {
                     $result = $callback($this);
-                    $this->connection->commit();
+                    $this->connection()->commit();
                     return $result;
                 } catch (Throwable $exception) {
-                    if ($this->connection->inTransaction()) $this->connection->rollBack();
+                    if ($this->connection()->inTransaction()) $this->connection()->rollBack();
                     throw $exception;
                 }
             });
@@ -69,13 +86,13 @@ if (!class_exists(PdoDatabaseAdapter::class, false)) {
 
         public function driver(): string
         {
-            $driver = strtolower((string)$this->connection->getAttribute(PDO::ATTR_DRIVER_NAME));
+            $driver = strtolower((string)$this->connection()->getAttribute(PDO::ATTR_DRIVER_NAME));
             return $driver === 'dblib' ? 'sqlsrv' : $driver;
         }
 
         public function lastInsertId(?string $name = null): string|false
         {
-            return $this->connection->lastInsertId($name);
+            return $this->connection()->lastInsertId($name);
         }
 
         public function pdo(): PDO
