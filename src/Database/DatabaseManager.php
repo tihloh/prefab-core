@@ -71,30 +71,29 @@ final class DatabaseManager implements DatabaseInterface
             $this->definitions[$this->defaultConnection] = $database['value'];
         }
 
-        foreach ($this->definitions as $name => $definition) {
-            $this->connections[$name] ??= $this->createConnection($name, $definition);
+        // Register connection capabilities without opening a socket to the database.
+        // Modules can continue resolving the same adapters; PDO is created on first use.
+        $names = $this->names();
+        if ($names !== [] && !in_array($this->defaultConnection, $names, true)) {
+            $this->defaultConnection = $names[0];
         }
 
-        if ($this->connections !== [] && !isset($this->connections[$this->defaultConnection])) {
-            $this->defaultConnection = (string) array_key_first($this->connections);
-        }
-
-        if ($this->connections === []) {
+        if ($names === []) {
             return;
         }
 
         PrefabRuntime::provide('database', $this, 'prefab-core', meta: [
             'connection' => $this->defaultConnection,
-            'driver' => $this->driver(),
+            'driver' => $this->configuredDriver($this->defaultConnection),
         ]);
         PrefabRuntime::provide('database_manager', $this, 'prefab-core');
 
-        foreach ($this->connections as $name => $connection) {
+        foreach ($names as $name) {
             PrefabRuntime::provide(
                 'database.connection.' . $name,
-                new PdoDatabaseAdapter($connection, 'database'),
+                new PdoDatabaseAdapter(fn(): PDO => $this->connection($name), 'database'),
                 'prefab-core',
-                meta: ['connection' => $name, 'driver' => $this->driver($name)],
+                meta: ['connection' => $name, 'driver' => $this->configuredDriver($name)],
             );
         }
     }
@@ -102,10 +101,13 @@ final class DatabaseManager implements DatabaseInterface
     public function connection(?string $name = null): PDO
     {
         $name ??= $this->defaultConnection;
-        if (!isset($this->connections[$name])) {
+        if (isset($this->connections[$name])) {
+            return $this->connections[$name];
+        }
+        if (!isset($this->definitions[$name])) {
             throw new RuntimeException("Database connection '{$name}' is not configured.");
         }
-        return $this->connections[$name];
+        return $this->connections[$name] = $this->createConnection($name, $this->definitions[$name]);
     }
 
     public function get(?string $name = null): PDO
@@ -131,13 +133,13 @@ final class DatabaseManager implements DatabaseInterface
 
     public function has(string $name): bool
     {
-        return isset($this->connections[$name]);
+        return isset($this->definitions[$name]) || isset($this->connections[$name]);
     }
 
     /** @return list<string> */
     public function names(): array
     {
-        return array_keys($this->connections);
+        return array_values(array_unique(array_merge(array_keys($this->definitions), array_keys($this->connections))));
     }
 
     public function table(string $table, ?string $connection = null): QueryBuilder
@@ -197,19 +199,20 @@ final class DatabaseManager implements DatabaseInterface
     public function set(string $name, PDO|array $definition): self
     {
         $this->definitions[$name] = $definition;
-        $this->connections[$name] = $this->createConnection($name, $definition);
+        // Replacing a definition invalidates its cached PDO instance.
+        unset($this->connections[$name]);
 
         PrefabRuntime::provide(
             'database.connection.' . $name,
-            new PdoDatabaseAdapter($this->connections[$name], 'database'),
+            new PdoDatabaseAdapter(fn(): PDO => $this->connection($name), 'database'),
             'prefab-core',
-            meta: ['connection' => $name, 'driver' => $this->driver($name)],
+            meta: ['connection' => $name, 'driver' => $this->configuredDriver($name)],
         );
 
         if ($name === $this->defaultConnection) {
             PrefabRuntime::provide('database', $this, 'prefab-core', meta: [
                 'connection' => $name,
-                'driver' => $this->driver($name),
+                'driver' => $this->configuredDriver($name),
             ]);
         }
 
@@ -224,7 +227,7 @@ final class DatabaseManager implements DatabaseInterface
         $this->defaultConnection = $name;
         PrefabRuntime::provide('database', $this, 'prefab-core', meta: [
             'connection' => $name,
-            'driver' => $this->driver($name),
+            'driver' => $this->configuredDriver($name),
         ]);
         return $this;
     }
@@ -249,6 +252,27 @@ final class DatabaseManager implements DatabaseInterface
         return PrefabRuntime::explainData('database');
     }
 
+    /** Get a driver label for diagnostics without opening a new PDO connection. */
+    private function configuredDriver(string $name): string
+    {
+        if (isset($this->connections[$name])) {
+            return $this->driver($name);
+        }
+        $definition = $this->definitions[$name] ?? null;
+        if ($definition instanceof PDO) {
+            $driver = strtolower((string) $definition->getAttribute(PDO::ATTR_DRIVER_NAME));
+            return $driver === 'dblib' ? 'sqlsrv' : $driver;
+        }
+        if (is_array($definition)) {
+            $driver = strtolower((string) ($definition['driver'] ?? ''));
+            if ($driver === '' && isset($definition['dsn'])) {
+                $driver = strtolower((string) strstr((string) $definition['dsn'], ':', true));
+            }
+            return $driver === 'mariadb' ? 'mysql' : ($driver === 'dblib' ? 'sqlsrv' : $driver);
+        }
+        return '';
+    }
+
     /** @param PDO|array<string, mixed> $definition */
     private function createConnection(string $name, PDO|array $definition): PDO
     {
@@ -263,6 +287,7 @@ final class DatabaseManager implements DatabaseInterface
         $options += [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_PERSISTENT => false,
         ];
 
         return new PDO($dsn, $username, $password, $options);
